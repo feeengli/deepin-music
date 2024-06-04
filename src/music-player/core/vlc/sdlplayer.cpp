@@ -26,6 +26,7 @@ extern "C" {
 #include "global.h"
 #include "vlcdynamicinstance.h"
 #include "checkdatazerothread.h"
+#include "checkdatacaching.h"
 #include "Media.h"
 #include "util/dbusutils.h"
 
@@ -54,6 +55,9 @@ extern "C" {
 //消息定义见patch https://gerrit.uniontech.com/c/base/libsdl2/+/23685
 #define SDL_AUDIO_ERR_MSG "Error writing to datastream"
 int g_playbackStatus = 0;
+static int64_t g_dataCache = 0;
+int g_dataCacheBlock = 0;
+bool g_onlyDecodePause = false;
 bool is_pa_connected = true;
 static QMutex vlc_mutex;
 
@@ -147,6 +151,20 @@ SdlPlayer::SdlPlayer(VlcInstance *instance)
         connect(this, &SdlPlayer::endReached, this, [=](){
             m_pCheckDataThread->initTimeParams();
         });
+
+        m_pCheckDataChingThread = new CheckDataCachingThread(this);
+        connect(m_pCheckDataChingThread, &CheckDataCachingThread::sigPusedDecode, this, [=](){
+            if (!m_pCheckDataChingThread->getPause()) {
+                g_onlyDecodePause = true;
+                VlcMediaPlayer::pause();
+            }
+        });
+        connect(m_pCheckDataChingThread, &CheckDataCachingThread::sigResumeDecode, this, [=](){
+            if (!m_pCheckDataChingThread->getPause()) {
+                g_onlyDecodePause = false;
+                VlcMediaPlayer::resume();
+            }
+        });
     }
     //}
 
@@ -169,6 +187,8 @@ SdlPlayer::~SdlPlayer()
         Quit();
         m_pCheckDataThread->quitThread();
         while (m_pCheckDataThread->isRunning()) {}
+        m_pCheckDataChingThread->quitThread();
+        while (m_pCheckDataChingThread->isRunning()) {}
     }
 
     //disconnect
@@ -215,6 +235,7 @@ void SdlPlayer::open(VlcMedia *media)
 
     VlcMediaPlayer::open(media);
     g_playbackStatus = PLAYBACK_STATUS_INIT;
+    g_dataCache = 0;
 }
 
 void SdlPlayer::play()
@@ -228,6 +249,11 @@ void SdlPlayer::play()
         if (!m_pCheckDataThread->isRunning())
             m_pCheckDataThread->start();
     }
+
+    QTimer::singleShot(500, this, [=](){
+        if (!m_pCheckDataChingThread->isRunning())
+            m_pCheckDataChingThread->start();
+    });
     switchOnceFlag = -1;
 }
 
@@ -261,6 +287,7 @@ void SdlPlayer::pause()
         }
     }
 
+    g_onlyDecodePause = false;
     VlcMediaPlayer::pause();
 }
 
@@ -343,6 +370,11 @@ bool SdlPlayer::getMute()
     return m_loadSdlLibrary ? m_mute : VlcMediaPlayer::getMute();
 }
 
+void SdlPlayer::setCachingThreadPause(bool pause)
+{
+    m_pCheckDataChingThread->setThreadPause(pause);
+}
+
 void SdlPlayer::setTime(qint64 time)
 {
     VlcMediaPlayer::setTime(time);
@@ -385,6 +417,7 @@ void SdlPlayer::libvlc_audio_play_cb(void *data, const void *samples, unsigned c
     if (sdlMediaPlayer->progressTag)
         return;
     int size = count * sdlMediaPlayer->obtainedAS.channels * sdlMediaPlayer->_rate / 8;
+    g_dataCache += size;
 
     /** vlc解析的通道数超过设置到sdl的通道数时，声音会出现沙哑的问题，
         原因是SDL支持的最大channel数为6,当超过这个阈值时，SDL本身是不支持的，会按照正常的指针偏移去读取下一桢数据，
@@ -415,7 +448,7 @@ void SdlPlayer::libvlc_audio_pause_cb(void *data, int64_t pts)
     Q_UNUSED(pts)
     SDL_GetAudioStatus_function GetAudioStatus = (SDL_GetAudioStatus_function)VlcDynamicInstance::VlcFunctionInstance()->resolveSdlSymbol("SDL_GetAudioStatus");
     SDL_PauseAudio_function PauseAudio = (SDL_PauseAudio_function)VlcDynamicInstance::VlcFunctionInstance()->resolveSdlSymbol("SDL_PauseAudio");
-    if (GetAudioStatus() != SDL_AUDIO_PAUSED && GetAudioStatus() != SDL_AUDIO_STOPPED)
+    if (GetAudioStatus() != SDL_AUDIO_PAUSED && GetAudioStatus() != SDL_AUDIO_STOPPED && !g_onlyDecodePause)
         PauseAudio(1);
 }
 
@@ -536,6 +569,11 @@ void SdlPlayer::SDL_audio_cbk(void *userdata, uint8_t *stream, int len)
     SDL_memset_function Memset = (SDL_memset_function)VlcDynamicInstance::VlcFunctionInstance()->resolveSdlSymbol("SDL_memset");
     SDL_MixAudio_function MixAudio = (SDL_MixAudio_function)VlcDynamicInstance::VlcFunctionInstance()->resolveSdlSymbol("SDL_MixAudio");
     SdlPlayer *sdlMediaPlayer = static_cast<SdlPlayer *>(userdata);
+        g_dataCache -= len;
+        if (g_dataCache > 0) {
+        g_dataCacheBlock = g_dataCache / len;
+    } else
+        g_dataCache = 0;
     Memset(stream, 0, size_t(len)); //init stream to forbid End symbol problem
     if (sdlMediaPlayer->_data.isEmpty()) {
         if (g_playbackStatus == PLAYBACK_STATUS_CHANGING) //it could better calculate time between vlc time and media duration to know if sdl reachs end.
@@ -565,6 +603,8 @@ void SdlPlayer::SDL_audio_cbk(void *userdata, uint8_t *stream, int len)
 void SdlPlayer::cleanMemCache()
 {
     QMutexLocker locker(&vlc_mutex);
+    g_dataCache = 0;
+    g_dataCacheBlock = 0;
     _data.clear();
 }
 
